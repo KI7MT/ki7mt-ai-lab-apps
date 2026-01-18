@@ -17,7 +17,8 @@ Source0:        %{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64 aarch64
 
 # Build requirements
-BuildRequires:  golang >= 1.24
+BuildRequires:  golang >= 1.22
+BuildRequires:  git
 BuildRequires:  make
 
 # Runtime requirements
@@ -79,6 +80,7 @@ make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
 %files solar
 %{_bindir}/solar-ingest
+%{_bindir}/solar-download
 
 %changelog
 * Sat Jan 18 2026 Greg Beam <ki7mt@outlook.com> - 2.0.0-1
