@@ -58,7 +58,7 @@ Solar flux data processing applications:
 - solar-ingest: NOAA solar indices ingestion into ClickHouse
 
 %prep
-%autosetup -n %{name}-v%{version}
+%autosetup -n %{name}-%{version}
 
 %build
 make all VERSION=%{version}
