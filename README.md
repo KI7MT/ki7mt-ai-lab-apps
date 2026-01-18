@@ -1,0 +1,153 @@
+# ki7mt-ai-lab-apps
+
+High-performance Go applications for KI7MT AI Lab WSPR/Solar data processing.
+
+## Overview
+
+This package provides command-line tools for ingesting and processing amateur radio propagation data from WSPR (Weak Signal Propagation Reporter) and NOAA solar indices. All ingestion tools use the ch-go native ClickHouse protocol with LZ4 compression for maximum throughput.
+
+## Applications
+
+### WSPR Ingestion Tools
+
+| Command | Source Format | Throughput | Description |
+|---------|---------------|------------|-------------|
+| `wspr-shredder` | Uncompressed CSV | 14.4 Mrps | Fastest for pre-extracted CSV files |
+| `wspr-turbo` | Compressed .gz | 8.8 Mrps | Zero-copy streaming from archives |
+| `wspr-parquet-native` | Parquet | 8.4 Mrps | Native Go Parquet reader |
+| `wspr-download` | - | - | Parallel archive downloader |
+
+### Solar Tools
+
+| Command | Description |
+|---------|-------------|
+| `solar-ingest` | NOAA solar flux data ingestion into ClickHouse |
+
+## Benchmarks (Ryzen 9 9950X3D, 10.7B rows)
+
+| Tool | Source Size | Time | Throughput |
+|------|-------------|------|------------|
+| wspr-shredder | 870 GB (CSV) | 12m24s | 14.40 Mrps |
+| wspr-turbo v1.1.0 | 184 GB (.gz) | 20m13s | 8.83 Mrps |
+| wspr-parquet-native | 103 GB (Parquet) | 21m13s | 8.41 Mrps |
+
+### End-to-End Pipeline Comparison
+
+| Pipeline | Total Time | Disk Written |
+|----------|------------|--------------|
+| decompress + shredder | ~37 min | 870 GB |
+| **wspr-turbo streaming** | **~20 min** | **0 GB** |
+
+## Requirements
+
+- Go 1.24+
+- ClickHouse server
+- ki7mt-ai-lab-core (database schemas)
+
+## Building
+
+```bash
+# Build all binaries
+make all
+
+# Build WSPR tools only
+make wspr
+
+# Build Solar tools only
+make solar
+
+# Show help
+make help
+```
+
+## Installation
+
+```bash
+# Install to /usr/bin
+sudo make install
+
+# Or stage for packaging
+DESTDIR=/tmp/stage make install
+```
+
+## COPR Installation (Fedora/RHEL/Rocky)
+
+```bash
+# Enable COPR repository
+sudo dnf copr enable ki7mt/ai-lab
+
+# Install packages
+sudo dnf install ki7mt-ai-lab-apps-wspr
+sudo dnf install ki7mt-ai-lab-apps-solar
+```
+
+## Usage Examples
+
+### wspr-turbo (Recommended for archived data)
+
+Stream directly from compressed archives - no intermediate disk I/O:
+
+```bash
+# Ingest all .gz files from directory
+wspr-turbo -source-dir /path/to/archives
+
+# Specify ClickHouse connection
+wspr-turbo -ch-host 192.168.1.100:9000 -ch-db wspr -ch-table spots \
+  -source-dir /path/to/archives
+```
+
+### wspr-shredder (Fastest for pre-extracted CSV)
+
+```bash
+# Ingest uncompressed CSV files
+wspr-shredder -source-dir /path/to/csv
+
+# With custom workers
+wspr-shredder -workers 16 -source-dir /path/to/csv
+```
+
+### wspr-parquet-native (For Parquet sources)
+
+```bash
+# Ingest Parquet files
+wspr-parquet-native -source-dir /path/to/parquet
+```
+
+## Architecture
+
+### wspr-turbo Pipeline
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  .csv.gz file   │────▶│  Stream Decomp   │────▶│  Vectorized     │
+│  (on disk)      │     │  (klauspost/gzip)│     │  CSV Parser     │
+└─────────────────┘     └──────────────────┘     └────────┬────────┘
+                                                          │
+                                                          ▼
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  ClickHouse     │◀────│  ch-go Native    │◀────│  Double Buffer  │
+│                 │     │  Blocks + LZ4    │     │  Fill A/Send B  │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+**Key Features:**
+- **Stream Decompress**: klauspost/gzip (ASM-optimized)
+- **Vectorized Parse**: Columnar buffers, no row structs
+- **Double-Buffer**: Fill block A while sending block B
+- **Zero-Alloc**: sync.Pool for 1M-row ColumnBlocks
+- **Native Protocol**: Binary wire format with LZ4
+
+## Performance Tuning
+
+- **Workers**: 16 optimal for 64 GB RAM (each worker uses ~4 GB)
+- **Block Size**: 1M rows per native block
+- **I/O Separation**: Best performance with source on separate device from ClickHouse
+- **Memory**: sync.Pool holds ~56 GB of buffers at 16 workers
+
+## License
+
+GPL-3.0-or-later
+
+## Author
+
+Greg Beam, KI7MT - ki7mt@outlook.com

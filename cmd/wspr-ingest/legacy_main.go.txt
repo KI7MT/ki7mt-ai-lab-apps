@@ -1,0 +1,878 @@
+// WSPR Ingestion Pipeline
+// CPU-Sovereign idempotent ingestion optimized for AMD Ryzen 9 9950X3D
+//
+// Architecture:
+//   1. File Producer: Walks data directory, queues .csv/.gz files
+//   2. Parser Workers: 32 goroutines (full 9950X3D utilization), decompress & parse CSV
+//   3. ClickHouse Writer: Bulk inserts using Native Protocol with ReplacingMergeTree
+//
+// ClickHouse Integration:
+//   - Native Protocol on port 9000 (NOT HTTP 8123)
+//   - Uses github.com/ClickHouse/clickhouse-go/v2 driver
+//   - PrepareBatch() for bulk inserts (5M rows per batch)
+//   - ASYNC INSERT enabled for high throughput
+//   - LZ4 compression on wire
+//   - DateTime for timestamp (seconds precision)
+//
+// Field Mapping (16-19 column WSPR CSV -> 21-column ClickHouse table):
+//   Index 0: ID (UInt64)              -> id (UInt64)
+//   Index 1: Timestamp (DateTime)     -> timestamp (DateTime)
+//   Index 2: Reporter (String)        -> reporter (String)
+//   Index 3: ReporterGrid (String)    -> reporter_grid (String)
+//   Index 4: SNR (Int8)               -> snr (Int8)
+//   Index 5: Frequency (UInt64)       -> frequency (UInt64, Hz)
+//   Index 6: Callsign (String)        -> callsign (String, sanitized)
+//   Index 7: Grid (String)            -> grid (String)
+//   Index 8: Power (Int8)             -> power (Int8)
+//   Index 9: Drift (Int8)             -> drift (Int8)
+//   Index 10: Distance (UInt32)       -> distance (UInt32)
+//   Index 11: Azimuth (UInt16)        -> azimuth (UInt16)
+//   Index 12: Band (ignored)          -> band (Int32, from GetBand normalization)
+//   Index 13: Version (String)        -> version (String)
+//   Index 14: Code (UInt8)            -> code (UInt8)
+//   Index 15: RxLat (Float32)         -> rx_lat (Float32, optional)
+//   Index 16: RxLon (Float32)         -> rx_lon (Float32, optional)
+//   Index 17: TxLat (Float32)         -> tx_lat (Float32, optional)
+//   Index 18: TxLon (Float32)         -> tx_lon (Float32, optional)
+//   (no CSV column)                   -> mode (String, default "WSPR")
+//   (no CSV column)                   -> column_count (UInt8, tracks CSV format)
+//
+// Performance Targets (9950X3D, 32 workers):
+//   - Ingest: 2-5 Mrps (million rows/sec)
+//   - CPU utilization: 90%+ across all cores
+//   - ClickHouse: No "too many parts" errors
+//
+// Usage:
+//   1. Ensure ClickHouse is running: systemctl status clickhouse-server
+//   2. Place .csv.gz files in data directory (e.g., /opt/wspr/archive/)
+//   3. Run ingestion: ./ingest /opt/wspr/archive/wsprspots-2026-01.csv.gz
+//   4. Monitor: clickhouse-client --database=wspr --query="SELECT count() FROM wspr_spots"
+package main
+
+import (
+	"compress/gzip"
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/gbeam/wspr-mcp/src/internal/parser"
+	"github.com/gbeam/wspr-mcp/src/internal/telemetry"
+)
+
+const (
+	// Configuration constants for maximum RTX 5090 throughput
+	BatchSize            = 1_000_000             // 1M spots per batch (64GB RAM runway for 9950X3D)
+	ClickHouseBatchSize  = 5_000_000             // 5M spots per ClickHouse batch (avoid 'too many parts')
+	CudaBufferPoolSize   = 8                     // 8 pre-allocated GPU buffers (1GB total, 32GB VRAM)
+	FileChannelBuffer    = 100                   // Buffered channel for file paths
+	ParsedChannelBuffer  = 64                    // Ring buffer for parsed batches (per user spec)
+	DedupedChannelBuffer = 64                    // Ring buffer for deduped batches
+	TelemetryInterval    = 5 * time.Second       // Print stats every 5 seconds
+
+	// Hardware-aware worker scaling
+	DefaultRAM = 64 // Default RAM in GB (9950X3D with 64GB configuration)
+)
+
+// Command-line flags (use double-dash convention: --ram, --limit)
+var (
+	ramGB = flag.Int("ram", DefaultRAM, "System RAM in GB (32=16 workers, 64+=32 workers)")
+	limit = flag.Int("limit", 0, "Limit number of rows to process (0 = no limit)")
+)
+
+// calculateWorkerCount scales worker pool based on available RAM
+// Rules:
+//   - 32GB RAM → 16 workers (conservative baseline)
+//   - 64GB+ RAM → 32 workers (full 9950X3D utilization)
+func calculateWorkerCount(ramGB int) int {
+	switch {
+	case ramGB >= 64:
+		return 32 // Full 9950X3D: 32 workers (all physical cores)
+	case ramGB >= 32:
+		return 16 // Conservative: 16 workers (half cores)
+	default:
+		return 8 // Low RAM: 8 workers (minimal)
+	}
+}
+
+// ParsedBatch represents a batch of spots parsed from a file
+// Ready for direct insertion into ClickHouse (no GPU deduplication)
+type ParsedBatch struct {
+	Batch      *parser.WsprBatch
+	FileSize   int64
+	FilePath   string
+	ParseStats parser.ParseStats // Per-file parsing statistics
+}
+
+// Pipeline orchestrates the full ingestion process
+// Simplified: Parser → ClickHouse direct stream (no GPU deduplication)
+type Pipeline struct {
+	// Channels for producer-consumer pattern
+	fileChan  chan string
+	batchChan chan *ParsedBatch // Parsed batches go directly to ClickHouse
+
+	// ClickHouse connection
+	clickhouse driver.Conn
+
+	// Telemetry
+	stats *telemetry.Stats
+
+	// Synchronization
+	wg        sync.WaitGroup // For main workers (producer, parsers, ClickHouse writer)
+	monitorWg sync.WaitGroup // For monitors and shutdown handler
+	ctx       context.Context
+	cancel    context.CancelFunc
+	shutdown  chan os.Signal
+
+	// Worker count
+	numParsers int
+
+	// Input path and row limit
+	inputPath     string
+	rowLimit      int
+	rowsMu        sync.Mutex
+	rowsProcessed int64
+}
+
+// NewPipeline creates a new ingestion pipeline with specified worker count, input path, and row limit
+func NewPipeline(numWorkers int, inputPath string, rowLimit int) (*Pipeline, error) {
+	// Use hardware-aware worker count
+	numParsers := numWorkers
+
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+
+	log.Println("Direct ingestion mode: Parser → ClickHouse (no GPU deduplication)")
+
+	// Initialize ClickHouse connection (Native Protocol on port 9000)
+	log.Println("Connecting to ClickHouse via Native Protocol (port 9000)...")
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Addr: []string{"127.0.0.1:9000"}, // Native Protocol (NOT HTTP 8123)
+		Auth: clickhouse.Auth{
+			Database: "wspr",
+			Username: "default",
+			Password: "",
+		},
+		Settings: clickhouse.Settings{
+			"max_execution_time":             60,
+			"async_insert":                   1,         // Enable ASYNC INSERT for high throughput
+			"wait_for_async_insert":          0,         // Don't wait for insert to complete
+			"async_insert_max_data_size":     100000000, // 100 MB buffer before flush
+			"async_insert_busy_timeout_ms":   1000,      // Flush after 1 second of inactivity
+			"max_insert_block_size":          1048576,   // 1M rows per block
+			"date_time_input_format":         "best_effort", // Handle various timestamp formats
+		},
+		Compression: &clickhouse.Compression{
+			Method: clickhouse.CompressionLZ4, // LZ4 compression on wire
+		},
+		MaxOpenConns:    2,
+		MaxIdleConns:    1,
+		ConnMaxLifetime: time.Hour,
+		DialTimeout:     5 * time.Second,
+		Debug:           false, // Set to true for verbose logging
+	})
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to connect to ClickHouse: %w", err)
+	}
+
+	// Verify connection
+	if err := conn.Ping(ctx); err != nil {
+		conn.Close()
+		cancel()
+		return nil, fmt.Errorf("ClickHouse ping failed: %w", err)
+	}
+
+	// Create table if not exists
+	if err := createClickHouseTable(ctx, conn); err != nil {
+		conn.Close()
+		cancel()
+		return nil, fmt.Errorf("failed to create ClickHouse table: %w", err)
+	}
+
+	// Initialize telemetry
+	stats := telemetry.NewStats()
+
+	// Setup signal handler for graceful shutdown
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+
+	p := &Pipeline{
+		fileChan:      make(chan string, FileChannelBuffer),
+		batchChan:     make(chan *ParsedBatch, ParsedChannelBuffer),
+		clickhouse:    conn,
+		stats:         stats,
+		ctx:           ctx,
+		cancel:        cancel,
+		shutdown:      shutdown,
+		numParsers:    numParsers,
+		inputPath:     inputPath,
+		rowLimit:      rowLimit,
+		rowsProcessed: 0,
+	}
+
+	return p, nil
+}
+
+// createClickHouseTable creates the WSPR spots table if it doesn't exist
+// Schema updated to full 16-19 column WSPRnet archive format with coordinate fields
+// Uses MergeTree (not ReplacingMergeTree) to match init-db.sh standard schema
+func createClickHouseTable(ctx context.Context, conn driver.Conn) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS wspr.spots (
+		id UInt64,
+		timestamp DateTime,
+		reporter String,
+		reporter_grid String,
+		snr Int8,
+		frequency UInt64,
+		callsign String,
+		grid String,
+		power Int8,
+		drift Int8,
+		distance UInt32,
+		azimuth UInt16,
+		band Int32,
+		mode String,
+		version String,
+		code UInt8,
+		rx_lat Float32,
+		rx_lon Float32,
+		tx_lat Float32,
+		tx_lon Float32,
+		column_count UInt8
+	) ENGINE = MergeTree()
+	PARTITION BY toYYYYMM(timestamp)
+	ORDER BY (timestamp, band, callsign)
+	`
+
+	if err := conn.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to create table: %w", err)
+	}
+
+	log.Println("ClickHouse table 'wspr.spots' ready (MergeTree, 21-column schema)")
+	return nil
+}
+
+// Run starts the ingestion pipeline
+func (p *Pipeline) Run() error {
+	log.Printf("Starting direct ingestion pipeline with %d parser workers", p.numParsers)
+
+	// Start telemetry reporter (500ms ticks for smooth display)
+	p.stats.StartReporter()
+	defer p.stats.StopReporter()
+
+	// Start shutdown handler - uses monitorWg
+	p.monitorWg.Add(1)
+	go p.handleShutdown()
+
+	// Start producer (file walker) - uses main wg
+	p.wg.Add(1)
+	go p.producer()
+
+	// Create a WaitGroup for parser workers only
+	var parserWg sync.WaitGroup
+
+	// Start parser workers - use main wg
+	for i := 0; i < p.numParsers; i++ {
+		p.wg.Add(1)
+		parserWg.Add(1)
+		go func(id int) {
+			defer parserWg.Done()
+			p.parserWorker(id)
+		}(i)
+	}
+
+	// Start a goroutine to close batchChan when all parsers are done
+	go func() {
+		parserWg.Wait()
+		close(p.batchChan)
+		log.Println("All parsers finished, batchChan closed")
+	}()
+
+	// Start ClickHouse writer - uses main wg
+	p.wg.Add(1)
+	go p.clickhouseWriter()
+
+	// Wait for all main workers to complete
+	p.wg.Wait()
+
+	log.Println("Main pipeline workers complete, initiating shutdown...")
+
+	// Cancel context to stop monitors and shutdown handler
+	p.cancel()
+
+	// Wait for monitors to finish
+	p.monitorWg.Wait()
+
+	log.Println("Pipeline shutdown complete")
+	return nil
+}
+
+// handleShutdown waits for SIGINT/SIGTERM and initiates graceful shutdown
+func (p *Pipeline) handleShutdown() {
+	defer p.monitorWg.Done()
+
+	select {
+	case sig := <-p.shutdown:
+		log.Printf("\nReceived signal %v, initiating graceful shutdown...", sig)
+		p.cancel()
+	case <-p.ctx.Done():
+		// Context already cancelled
+	}
+}
+
+// producer walks the data directory and pushes file paths to the channel
+func (p *Pipeline) producer() {
+	defer p.wg.Done()
+	defer close(p.fileChan)
+
+	// Check if input path is a file or directory
+	info, err := os.Stat(p.inputPath)
+	if err != nil {
+		log.Printf("Producer: error accessing %s: %v", p.inputPath, err)
+		return
+	}
+
+	if info.IsDir() {
+		// Scan directory recursively
+		log.Printf("Producer: scanning directory %s", p.inputPath)
+		err := filepath.Walk(p.inputPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				log.Printf("Producer: error accessing %s: %v", path, err)
+				return nil // Continue walking
+			}
+
+			// Check for shutdown
+			select {
+			case <-p.ctx.Done():
+				return fmt.Errorf("shutdown requested")
+			default:
+			}
+
+			// Only process .gz and .csv files
+			ext := filepath.Ext(path)
+			if info.IsDir() || (ext != ".gz" && ext != ".csv") {
+				return nil
+			}
+
+			// Push file path to channel
+			select {
+			case p.fileChan <- path:
+				log.Printf("Producer: queued %s (%d bytes)", filepath.Base(path), info.Size())
+			case <-p.ctx.Done():
+				return fmt.Errorf("shutdown requested")
+			}
+
+			return nil
+		})
+
+		if err != nil && p.ctx.Err() == nil {
+			log.Printf("Producer: walk error: %v", err)
+		}
+	} else {
+		// Single file
+		log.Printf("Producer: processing single file %s", p.inputPath)
+		ext := filepath.Ext(p.inputPath)
+		if ext != ".gz" && ext != ".csv" {
+			log.Printf("Producer: unsupported file extension %s (expected .gz or .csv)", ext)
+			return
+		}
+
+		select {
+		case p.fileChan <- p.inputPath:
+			log.Printf("Producer: queued %s (%d bytes)", filepath.Base(p.inputPath), info.Size())
+		case <-p.ctx.Done():
+			log.Println("Producer: shutdown requested")
+			return
+		}
+	}
+
+	log.Println("Producer: finished scanning")
+}
+
+// parserWorker reads files, mmaps them, and parses WSPR spots using batch rotation
+func (p *Pipeline) parserWorker(id int) {
+	defer p.wg.Done()
+
+	var parseStats parser.ParseStats
+
+	log.Printf("Parser[%d]: started", id)
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			log.Printf("Parser[%d]: shutdown", id)
+			return
+
+		case filePath, ok := <-p.fileChan:
+			if !ok {
+				log.Printf("Parser[%d]: file channel closed, exiting", id)
+				return
+			}
+
+			// Parse file with batch rotation (parseFile sends batches as they fill)
+			startTime := time.Now()
+			_, err := p.parseFile(filePath, &parseStats)
+			if err != nil {
+				log.Printf("Parser[%d]: error parsing %s: %v", id, filepath.Base(filePath), err)
+				continue
+			}
+
+			elapsed := time.Since(startTime)
+			log.Printf("Parser[%d]: parsed %s (%d total rows in %v)", id, filepath.Base(filePath), parseStats.SuccessfullyParsed, elapsed)
+
+			// Check row limit (global check across all workers)
+			if p.rowLimit > 0 {
+				p.rowsMu.Lock()
+				currentRows := p.rowsProcessed
+				p.rowsMu.Unlock()
+
+				if currentRows >= int64(p.rowLimit) {
+					log.Printf("Parser[%d]: row limit %d reached (%d processed), stopping", id, p.rowLimit, currentRows)
+					// Don't cancel context yet - let workers finish processing batches
+					return
+				}
+
+				log.Printf("Parser[%d]: progress %d/%d rows (%.1f%%)", id, currentRows, p.rowLimit,
+					float64(currentRows)/float64(p.rowLimit)*100)
+			}
+		}
+	}
+}
+
+// parseFile parses a single WSPR CSV file (handles both .csv and .gz files)
+// Implements batch rotation: sends multiple batches to parsedChan as the file is parsed
+// Auto-truncates the partition before ingestion for idempotent daily refreshes
+func (p *Pipeline) parseFile(filePath string, stats *parser.ParseStats) (int64, error) {
+	// Extract YYYY-MM from filename and truncate partition
+	if err := p.truncatePartitionFromFilename(filePath); err != nil {
+		log.Printf("Warning: failed to truncate partition for %s: %v", filepath.Base(filePath), err)
+	}
+
+	// Get file size
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return 0, err
+	}
+	fileSize := info.Size()
+
+	// Track bytes read for telemetry (accurate GB counter)
+	p.stats.AddBytes(uint64(fileSize))
+
+	// Reset stats
+	*stats = parser.ParseStats{}
+
+	// Create initial batch
+	batch := parser.NewWsprBatch(BatchSize)
+
+	// Create batch rotation callback
+	// When a batch is full, send it to GPU dispatcher and return a new empty batch
+	onBatchFull := func(fullBatch *parser.WsprBatch) (*parser.WsprBatch, error) {
+		// Check row limit before sending batch
+		if p.rowLimit > 0 {
+			p.rowsMu.Lock()
+			remaining := int64(p.rowLimit) - p.rowsProcessed
+			if remaining <= 0 {
+				p.rowsMu.Unlock()
+				return nil, fmt.Errorf("row limit %d reached, stopping parse", p.rowLimit)
+			}
+
+			// Truncate batch if it exceeds remaining limit
+			if int64(fullBatch.Count) > remaining {
+				fullBatch.Count = int(remaining)
+			}
+
+			p.rowsProcessed += int64(fullBatch.Count)
+			p.rowsMu.Unlock()
+		}
+
+		// Send full batch to ClickHouse writer
+		parsed := &ParsedBatch{
+			Batch:      fullBatch,
+			FileSize:   fileSize,
+			FilePath:   filePath,
+			ParseStats: *stats, // Snapshot current stats
+		}
+
+		select {
+		case p.batchChan <- parsed:
+			// Return new empty batch for continued parsing
+			return parser.NewWsprBatch(BatchSize), nil
+		case <-p.ctx.Done():
+			return nil, fmt.Errorf("context cancelled during batch rotation")
+		}
+	}
+
+	// Check if file is gzipped
+	isGzipped := strings.HasSuffix(filePath, ".gz")
+
+	if isGzipped {
+		// For .gz files, stream directly from gzip reader (BIG DATA RESILIENCE: avoid loading 20GB+ into memory)
+		f, err := os.Open(filePath)
+		if err != nil {
+			return 0, fmt.Errorf("open failed: %w", err)
+		}
+		defer f.Close()
+
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return 0, fmt.Errorf("gzip reader failed: %w", err)
+		}
+		defer gz.Close()
+
+		log.Printf("Streaming parse: %s (gzip decompression + CSV parsing, low memory footprint)", filepath.Base(filePath))
+
+		// Parse using streaming CSV reader with error throttling and batch rotation
+		// This avoids loading the entire decompressed file into memory
+		err = parser.ParseCsvStreamWithCSVReader(gz, batch, filePath, stats, onBatchFull)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		// For uncompressed .csv files, use mmap for zero-copy
+		data, f, err := parser.MmapFile(filePath)
+		if err != nil {
+			return 0, fmt.Errorf("mmap failed: %w", err)
+		}
+		defer parser.UnmapFile(data, f)
+
+		err = p.parseCsvData(data, batch, filePath, stats, onBatchFull)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	// Send final partial batch if it has any spots
+	if batch.Count > 0 {
+		// Check row limit for final batch
+		if p.rowLimit > 0 {
+			p.rowsMu.Lock()
+			remaining := int64(p.rowLimit) - p.rowsProcessed
+			if remaining <= 0 {
+				p.rowsMu.Unlock()
+				return fileSize, nil // Limit reached, don't send final batch
+			}
+
+			// Truncate final batch if it exceeds remaining limit
+			if int64(batch.Count) > remaining {
+				batch.Count = int(remaining)
+			}
+
+			p.rowsProcessed += int64(batch.Count)
+			p.rowsMu.Unlock()
+		}
+
+		parsed := &ParsedBatch{
+			Batch:      batch,
+			FileSize:   fileSize,
+			FilePath:   filePath,
+			ParseStats: *stats,
+		}
+
+		select {
+		case p.batchChan <- parsed:
+			// Batch sent successfully
+		case <-p.ctx.Done():
+			return 0, fmt.Errorf("context cancelled sending final batch")
+		}
+	}
+
+	return fileSize, nil
+}
+
+// parseCsvData parses CSV data using encoding/csv with LazyQuotes enabled
+// This provides robust error handling for malformed CSV lines
+func (p *Pipeline) parseCsvData(data []byte, batch *parser.WsprBatch, filePath string, stats *parser.ParseStats, onBatchFull parser.BatchFullCallback) error {
+	// Use the new CSV parser with LazyQuotes for robustness, error throttling, and batch rotation
+	return parser.ParseCsvDataWithCSVReader(data, batch, filePath, stats, onBatchFull)
+}
+
+
+// clickhouseWriter receives deduped batches and writes them to ClickHouse
+// Uses Native Protocol (port 9000) with PrepareBatch for bulk inserts
+// Batches are flushed when reaching ClickHouseBatchSize (5M rows) or on shutdown
+func (p *Pipeline) clickhouseWriter() {
+	defer p.wg.Done()
+
+	log.Println("ClickHouse Writer: started (Native Protocol bulk insert mode)")
+
+	var pendingBatch driver.Batch
+	var pendingCount int
+	var batchStartTime time.Time
+
+	// Helper to flush pending batch using Send()
+	flushBatch := func() error {
+		if pendingBatch == nil || pendingCount == 0 {
+			return nil
+		}
+
+		if err := pendingBatch.Send(); err != nil {
+			return fmt.Errorf("batch send: %w", err)
+		}
+
+		elapsed := time.Since(batchStartTime)
+		rowsPerSec := float64(pendingCount) / elapsed.Seconds() / 1_000_000
+		log.Printf("ClickHouse Writer: flushed %d spots in %v (%.2f Mrps)", pendingCount, elapsed, rowsPerSec)
+
+		// Update telemetry
+		p.stats.AddRows(uint64(pendingCount))
+
+		pendingBatch = nil
+		pendingCount = 0
+		return nil
+	}
+
+	// Ensure final batch is flushed on exit
+	defer func() {
+		if err := flushBatch(); err != nil {
+			log.Printf("ClickHouse Writer: error flushing final batch: %v", err)
+		}
+		log.Println("ClickHouse Writer: shutdown complete")
+	}()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			log.Println("ClickHouse Writer: shutdown requested, flushing...")
+			return
+
+		case parsed, ok := <-p.batchChan:
+			if !ok {
+				log.Println("ClickHouse Writer: batch channel closed, flushing...")
+				return
+			}
+
+			// Print per-file summary table
+			printFileSummary(filepath.Base(parsed.FilePath), &parsed.ParseStats, parsed.Batch.Count)
+
+			// Create new batch if needed (using PrepareBatch for bulk insert)
+			if pendingBatch == nil {
+				var err error
+				pendingBatch, err = p.clickhouse.PrepareBatch(p.ctx, "INSERT INTO wspr.spots")
+				if err != nil {
+					log.Printf("ClickHouse Writer: failed to prepare batch: %v", err)
+					continue
+				}
+				batchStartTime = time.Now()
+				log.Printf("ClickHouse Writer: new batch started")
+			}
+
+			// Append spots to batch - field order MUST match 21-column schema
+			// Full WSPRnet Archive Format (16-19 columns) with coordinate fields
+			for i := 0; i < parsed.Batch.Count; i++ {
+				spot := &parsed.Batch.Spots[i]
+
+				// Map to 21-column MergeTree schema:
+				// 1. id            UInt64    <- spot.SpotID
+				// 2. timestamp     DateTime  <- spot.Timestamp
+				// 3. reporter      String    <- spot.Reporter
+				// 4. reporter_grid String    <- spot.ReporterGrid
+				// 5. snr           Int8      <- spot.SNR
+				// 6. frequency     UInt64    <- spot.Frequency (Hz)
+				// 7. callsign      String    <- spot.Callsign (sanitized)
+				// 8. grid          String    <- spot.Grid
+				// 9. power         Int8      <- spot.Power
+				// 10. drift        Int8      <- spot.Drift
+				// 11. distance     UInt32    <- spot.Distance
+				// 12. azimuth      UInt16    <- spot.Azimuth
+				// 13. band         Int32     <- spot.Band
+				// 14. mode         String    <- spot.Mode (default "WSPR")
+				// 15. version      String    <- spot.Version
+				// 16. code         UInt8     <- spot.Code
+				// 17. rx_lat       Float32   <- spot.RxLat
+				// 18. rx_lon       Float32   <- spot.RxLon
+				// 19. tx_lat       Float32   <- spot.TxLat
+				// 20. tx_lon       Float32   <- spot.TxLon
+				// 21. column_count UInt8     <- spot.ColumnCount
+				err := pendingBatch.Append(
+					spot.SpotID,       // UInt64
+					spot.Timestamp,    // DateTime
+					spot.Reporter,     // String
+					spot.ReporterGrid, // String
+					spot.SNR,          // Int8
+					spot.Frequency,    // UInt64
+					spot.Callsign,     // String (sanitized)
+					spot.Grid,         // String
+					spot.Power,        // Int8
+					spot.Drift,        // Int8
+					spot.Distance,     // UInt32
+					spot.Azimuth,      // UInt16
+					spot.Band,         // Int32
+					spot.Mode,         // String
+					spot.Version,      // String
+					spot.Code,         // UInt8
+					spot.RxLat,        // Float32
+					spot.RxLon,        // Float32
+					spot.TxLat,        // Float32
+					spot.TxLon,        // Float32
+					spot.ColumnCount,  // UInt8
+				)
+				if err != nil {
+					log.Printf("ClickHouse Writer: failed to append spot: %v", err)
+					continue
+				}
+				pendingCount++
+			}
+
+			log.Printf("ClickHouse Writer: accumulated %d spots from %s (total pending: %d)",
+				parsed.Batch.Count, filepath.Base(parsed.FilePath), pendingCount)
+
+			// Flush if batch is large enough
+			if pendingCount >= ClickHouseBatchSize {
+				if err := flushBatch(); err != nil {
+					log.Printf("ClickHouse Writer: flush error: %v", err)
+				}
+			}
+		}
+	}
+}
+
+
+// truncatePartitionFromFilename extracts YYYY-MM from filename and drops the partition
+// Example: wsprspots-2026-01.csv.gz -> DROP PARTITION '202601'
+func (p *Pipeline) truncatePartitionFromFilename(filePath string) error {
+	// Extract filename from path
+	fileName := filepath.Base(filePath)
+
+	// Parse filename pattern: wsprspots-YYYY-MM.csv[.gz]
+	// Use regex or string parsing
+	var year, month string
+	if len(fileName) > 15 && fileName[0:10] == "wsprspots-" {
+		// Extract YYYY-MM from wsprspots-YYYY-MM.csv.gz
+		yearMonth := fileName[10:17] // "2026-01"
+		parts := strings.Split(yearMonth, "-")
+		if len(parts) == 2 {
+			year = parts[0]
+			month = parts[1]
+		}
+	}
+
+	if year == "" || month == "" {
+		return fmt.Errorf("could not extract YYYY-MM from filename: %s", fileName)
+	}
+
+	// Format as YYYYMM for ClickHouse partition
+	partition := year + month
+
+	// Drop partition (idempotent - won't error if partition doesn't exist)
+	query := fmt.Sprintf("ALTER TABLE wspr.spots DROP PARTITION '%s'", partition)
+	log.Printf("Truncating partition %s for file %s", partition, fileName)
+
+	if err := p.clickhouse.Exec(p.ctx, query); err != nil {
+		// Check if error is "partition not found" - this is OK for first-time ingestion
+		if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "NO_SUCH_DATA_PART") {
+			return fmt.Errorf("failed to drop partition %s: %w", partition, err)
+		}
+		log.Printf("Partition %s does not exist (first-time ingestion)", partition)
+	} else {
+		log.Printf("Successfully dropped partition %s", partition)
+	}
+
+	return nil
+}
+
+// Close releases all resources
+func (p *Pipeline) Close() error {
+	log.Println("Closing pipeline resources...")
+
+	// Close ClickHouse connection
+	if p.clickhouse != nil {
+		if err := p.clickhouse.Close(); err != nil {
+			return fmt.Errorf("clickhouse close: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// printFileSummary prints a per-file ingestion summary table
+// printFileSummary prints a per-file ingestion summary (no GPU dedup - direct ingestion)
+func printFileSummary(fileName string, stats *parser.ParseStats, ingestedCount int) {
+	log.Printf("┌─────────────────────────────────────────────────────────────────")
+	log.Printf("│ File Summary: %s", fileName)
+	log.Printf("├─────────────────────────────────────────────────────────────────")
+	log.Printf("│ Total Rows Read:          %10d", stats.TotalRowsRead)
+	log.Printf("│ Successfully Parsed:       %10d", stats.SuccessfullyParsed)
+	log.Printf("│ Failed (Malformed):        %10d", stats.FailedRows)
+	log.Printf("│ Skipped (Empty):           %10d", stats.SkippedEmptyRows)
+	log.Printf("│ Sent to ClickHouse:        %10d", ingestedCount)
+	log.Printf("└─────────────────────────────────────────────────────────────────")
+}
+
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+
+	// Custom usage function
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] <path>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "WSPR Ingestion Pipeline - Hardware-aware parallel ingestion with GPU deduplication\n\n")
+		fmt.Fprintf(os.Stderr, "Arguments:\n")
+		fmt.Fprintf(os.Stderr, "  path    Path to .csv/.csv.gz file or directory containing WSPR data\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s --ram 64 --limit 100000 data.csv       # Process first 100k rows with 32 workers\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --ram 32 /opt/wspr/raw/                # Process all files in directory with 16 workers\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s wsprspots-2013-03.csv.gz               # Process single .gz file with default settings\n", os.Args[0])
+	}
+
+	// Parse command-line flags
+	flag.Parse()
+
+	// Get positional argument (input path)
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Error: missing required argument <path>\n\n")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	inputPath := args[0]
+
+	log.Println("WSPR Ingestion Pipeline Starting...")
+	log.Printf("Input: %s", inputPath)
+	if *limit > 0 {
+		log.Printf("Row Limit: %d rows", *limit)
+	} else {
+		log.Printf("Row Limit: unlimited")
+	}
+
+	// Calculate worker count based on RAM
+	numWorkers := calculateWorkerCount(*ramGB)
+	log.Printf("Hardware Configuration: %d GB RAM → %d parser workers", *ramGB, numWorkers)
+	log.Printf("CPU-Only Pipeline: Sanitizer + Band Normalizer integrated in parser loop")
+
+	// Create pipeline with hardware-aware worker count
+	pipeline, err := NewPipeline(numWorkers, inputPath, *limit)
+	if err != nil {
+		log.Fatalf("Failed to create pipeline: %v", err)
+	}
+	defer pipeline.Close()
+
+	// Run pipeline
+	if err := pipeline.Run(); err != nil {
+		log.Fatalf("Pipeline error: %v", err)
+	}
+
+	// Print final statistics
+	fmt.Printf("\n\n=== Final Statistics ===\n")
+	fmt.Printf("Total Rows Processed: %d\n", pipeline.stats.GetTotalRows())
+	fmt.Printf("Total Bytes Read: %.2f GB\n", float64(pipeline.stats.GetTotalBytes())/(1024*1024*1024))
+	if *limit > 0 {
+		fmt.Printf("Row Limit: %d (%.1f%% of limit used)\n", *limit,
+			float64(pipeline.stats.GetTotalRows())/float64(*limit)*100)
+	}
+	fmt.Printf("========================\n")
+
+	log.Println("Ingestion complete!")
+}
