@@ -5,7 +5,7 @@
 %global goipath         github.com/KI7MT/ki7mt-ai-lab-apps
 
 Name:           ki7mt-ai-lab-apps
-Version:        2.0.0
+Version:        2.0.3
 Release:        1%{?dist}
 Summary:        High-performance WSPR/Solar data ingestion tools for ClickHouse
 
@@ -85,7 +85,11 @@ make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 %{_bindir}/solar-download
 
 %changelog
-* Sun Jan 18 2026 Greg Beam <ki7mt@outlook.com> - 2.0.0-1
+* Mon Jan 20 2025 Greg Beam <ki7mt@yahoo.com> - 2.0.3-1
+- Sync version across all lab packages
+- Fix maintainer email in changelog
+
+* Sun Jan 18 2025 Greg Beam <ki7mt@yahoo.com> - 2.0.0-1
 - Major release with high-performance ingestion tools
 - Add wspr-shredder: 14.4 Mrps uncompressed CSV ingester
 - Add wspr-turbo: 8.8 Mrps streaming .gz ingester with klauspost/gzip
@@ -94,7 +98,7 @@ make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 - Remove CUDA/GPU dependencies (CPU-only, static binaries)
 - Update to Go 1.24
 
-* Sat Jan 17 2026 Greg Beam <ki7mt@outlook.com> - 1.0.0-1
+* Sat Jan 17 2025 Greg Beam <ki7mt@yahoo.com> - 1.0.0-1
 - Initial package release
 - Add wspr-ingest: CSV ingestion with dual-path (GPU/CPU)
 - Add wspr-download: Parallel WSPR archive downloader
