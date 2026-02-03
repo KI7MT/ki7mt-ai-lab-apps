@@ -5,7 +5,7 @@
 %global goipath         github.com/KI7MT/ki7mt-ai-lab-apps
 
 Name:           ki7mt-ai-lab-apps
-Version:        2.0.8
+Version:        2.1.0
 Release:        1%{?dist}
 Summary:        High-performance WSPR/Solar data ingestion tools for ClickHouse
 
@@ -92,6 +92,13 @@ make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 %{_bindir}/solar-history-load
 
 %changelog
+* Mon Feb 03 2026 Greg Beam <ki7mt@yahoo.com> - 2.1.0-1
+- Normalize band from frequency in all 5 CSV ingesters via bands.GetBand()
+- Add internal/bands package: ADIF-MCP v3.1.6 full-spectrum band lookup
+- Remove legacy Python ingester (source of band column contamination)
+- Update benchmarks: wspr-turbo 24.67 Mrps, wspr-shredder 21.81 Mrps (9975WX)
+- Align version across all lab packages at 2.1.0
+
 * Mon Feb 03 2026 Greg Beam <ki7mt@yahoo.com> - 2.0.8-1
 - Fix Silent Sun: solar-download now fetches NOAA SFI summary endpoint
 - Add 3 new NOAA data sources (SFI live, SFI 30-day, X-ray 7-day)
