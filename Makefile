@@ -54,6 +54,9 @@ WSPR_CMDS   := wspr-shredder wspr-turbo wspr-parquet-native wspr-download
 SOLAR_CMDS  := solar-ingest solar-download
 ALL_CMDS    := $(WSPR_CMDS) $(SOLAR_CMDS)
 
+# Shell scripts to install
+SOLAR_SCRIPTS := solar-refresh.sh
+
 # =============================================================================
 # Default Target
 # =============================================================================
@@ -73,7 +76,9 @@ help:
 	@printf "  wspr-download        WSPR archive downloader\n"
 	@printf "\n"
 	@printf "Solar Tools:\n"
-	@printf "  solar-ingest         NOAA solar flux ingester\n"
+	@printf "  solar-download       Multi-source solar data downloader\n"
+	@printf "  solar-ingest         Solar/geomagnetic data ingester\n"
+	@printf "  solar-refresh        Download + ingest pipeline script\n"
 	@printf "\n"
 	@printf "Usage: make [target]\n"
 	@printf "\n"
@@ -181,12 +186,19 @@ install: all
 		printf "  Installing $$cmd...\n"; \
 		install -m 755 $(BINDIR_BUILD)/$$cmd $(DESTDIR)$(BINDIR)/; \
 	done
-	@printf "\nInstalled $(words $(ALL_CMDS)) binaries to $(DESTDIR)$(BINDIR)/\n"
+	@for script in $(SOLAR_SCRIPTS); do \
+		printf "  Installing $${script%.sh}...\n"; \
+		install -m 755 scripts/$$script $(DESTDIR)$(BINDIR)/$${script%.sh}; \
+	done
+	@printf "\nInstalled $(words $(ALL_CMDS)) binaries + $(words $(SOLAR_SCRIPTS)) scripts to $(DESTDIR)$(BINDIR)/\n"
 
 uninstall:
 	@printf "Uninstalling $(NAME) from $(DESTDIR)$(PREFIX)...\n"
 	@for cmd in $(ALL_CMDS); do \
 		rm -f $(DESTDIR)$(BINDIR)/$$cmd; \
+	done
+	@for script in $(SOLAR_SCRIPTS); do \
+		rm -f $(DESTDIR)$(BINDIR)/$${script%.sh}; \
 	done
 	rm -rf $(DESTDIR)$(DATADIR)
 	rm -rf $(DESTDIR)$(SYSCONFDIR)

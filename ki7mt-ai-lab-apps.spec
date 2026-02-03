@@ -5,7 +5,7 @@
 %global goipath         github.com/KI7MT/ki7mt-ai-lab-apps
 
 Name:           ki7mt-ai-lab-apps
-Version:        2.0.4
+Version:        2.0.5
 Release:        1%{?dist}
 Summary:        High-performance WSPR/Solar data ingestion tools for ClickHouse
 
@@ -56,8 +56,10 @@ Summary:        Solar flux data processing tools
 Requires:       %{name} = %{version}-%{release}
 
 %description solar
-Solar flux data processing applications:
-- solar-ingest: NOAA solar indices ingestion into ClickHouse
+Solar and geomagnetic data processing applications:
+- solar-download: Multi-source solar data downloader (SIDC, NOAA, GOES)
+- solar-ingest:   Solar/geomagnetic data ingestion (SFI, SSN, Kp, Ap, X-ray)
+- solar-refresh:  Download + truncate + ingest pipeline script
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -83,6 +85,7 @@ make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 %files solar
 %{_bindir}/solar-ingest
 %{_bindir}/solar-download
+%{_bindir}/solar-refresh
 
 %changelog
 * Mon Jan 20 2025 Greg Beam <ki7mt@yahoo.com> - 2.0.3-1

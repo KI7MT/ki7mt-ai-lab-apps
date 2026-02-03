@@ -29,7 +29,7 @@ import (
 )
 
 // Version can be overridden at build time via -ldflags
-var Version = "2.0.4"
+var Version = "2.0.5"
 
 // SFIRecord represents a record from NOAA SFI JSON
 type SFIRecord struct {
