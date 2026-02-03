@@ -60,6 +60,20 @@ var sources = []DataSource{
 		Filename: "penticton_flux.txt",
 		Desc:     "Penticton 10.7cm daily flux",
 	},
+	// Geomagnetic indices (Earth Response)
+	{
+		Name:     "noaa_kp",
+		URL:      "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json",
+		Filename: "noaa_kp_index.json",
+		Desc:     "NOAA planetary K-index (3-hourly geomagnetic)",
+	},
+	// X-Ray flux (Radio Blackouts)
+	{
+		Name:     "goes_xray",
+		URL:      "https://services.swpc.noaa.gov/json/goes/primary/xrays-6-hour.json",
+		Filename: "goes_xray_flux.json",
+		Desc:     "GOES X-ray flux (6-hour rolling window)",
+	},
 }
 
 func downloadFile(url, destPath string, timeout time.Duration) error {

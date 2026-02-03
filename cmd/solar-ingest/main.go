@@ -33,13 +33,24 @@ var Version = "2.0.0"
 
 // SFIRecord represents a record from NOAA SFI JSON
 type SFIRecord struct {
-	TimeTag       string  `json:"time-tag"`
-	SSN           float64 `json:"ssn"`
-	SmoothedSSN   float64 `json:"smoothed_ssn"`
-	ObservedSWPC  float64 `json:"observed_swpc_ssn"`
-	SmoothedSWPC  float64 `json:"smoothed_swpc_ssn"`
-	F107          float64 `json:"f10.7"`
-	SmoothedF107  float64 `json:"smoothed_f10.7"`
+	TimeTag      string  `json:"time-tag"`
+	SSN          float64 `json:"ssn"`
+	SmoothedSSN  float64 `json:"smoothed_ssn"`
+	ObservedSWPC float64 `json:"observed_swpc_ssn"`
+	SmoothedSWPC float64 `json:"smoothed_swpc_ssn"`
+	F107         float64 `json:"f10.7"`
+	SmoothedF107 float64 `json:"smoothed_f10.7"`
+}
+
+// XrayRecord represents a record from GOES X-ray flux JSON
+type XrayRecord struct {
+	TimeTag              string  `json:"time_tag"`
+	Satellite            int     `json:"satellite"`
+	Flux                 float64 `json:"flux"`
+	ObservedFlux         float64 `json:"observed_flux"`
+	ElectronCorrection   float64 `json:"electron_correction"`
+	ElectronContaminated bool    `json:"electron_contaminaton"` // Note: NOAA typo in API
+	Energy               string  `json:"energy"`
 }
 
 // SolarBatch holds column data for native insert
@@ -51,6 +62,8 @@ type SolarBatch struct {
 	SSN          *proto.ColFloat32
 	KpIndex      *proto.ColFloat32
 	ApIndex      *proto.ColFloat32
+	XrayShort    *proto.ColFloat32
+	XrayLong     *proto.ColFloat32
 	SourceFile   *proto.ColStr
 }
 
@@ -63,6 +76,8 @@ func NewSolarBatch() *SolarBatch {
 		SSN:          new(proto.ColFloat32),
 		KpIndex:      new(proto.ColFloat32),
 		ApIndex:      new(proto.ColFloat32),
+		XrayShort:    new(proto.ColFloat32),
+		XrayLong:     new(proto.ColFloat32),
 		SourceFile:   new(proto.ColStr),
 	}
 }
@@ -75,6 +90,8 @@ func (b *SolarBatch) Reset() {
 	b.SSN.Reset()
 	b.KpIndex.Reset()
 	b.ApIndex.Reset()
+	b.XrayShort.Reset()
+	b.XrayLong.Reset()
 	b.SourceFile.Reset()
 }
 
@@ -91,11 +108,13 @@ func (b *SolarBatch) Input() proto.Input {
 		{Name: "ssn", Data: b.SSN},
 		{Name: "kp_index", Data: b.KpIndex},
 		{Name: "ap_index", Data: b.ApIndex},
+		{Name: "xray_short", Data: b.XrayShort},
+		{Name: "xray_long", Data: b.XrayLong},
 		{Name: "source_file", Data: b.SourceFile},
 	}
 }
 
-func (b *SolarBatch) AddRecord(date time.Time, observedFlux, adjustedFlux, ssn, kp, ap float32, sourceFile string) {
+func (b *SolarBatch) AddRecord(date time.Time, observedFlux, adjustedFlux, ssn, kp, ap, xrayShort, xrayLong float32, sourceFile string) {
 	b.Date.Append(date)
 	b.Time.Append(date)
 	b.ObservedFlux.Append(observedFlux)
@@ -103,6 +122,8 @@ func (b *SolarBatch) AddRecord(date time.Time, observedFlux, adjustedFlux, ssn, 
 	b.SSN.Append(ssn)
 	b.KpIndex.Append(kp)
 	b.ApIndex.Append(ap)
+	b.XrayShort.Append(xrayShort)
+	b.XrayLong.Append(xrayLong)
 	b.SourceFile.Append(sourceFile)
 }
 
@@ -111,7 +132,7 @@ func flushBatch(ctx context.Context, conn *ch.Client, tableFQN string, batch *So
 		return nil
 	}
 
-	query := fmt.Sprintf("INSERT INTO %s (date, time, observed_flux, adjusted_flux, ssn, kp_index, ap_index, source_file) VALUES", tableFQN)
+	query := fmt.Sprintf("INSERT INTO %s (date, time, observed_flux, adjusted_flux, ssn, kp_index, ap_index, xray_short, xray_long, source_file) VALUES", tableFQN)
 	return conn.Do(ctx, ch.Query{
 		Body:  query,
 		Input: batch.Input(),
@@ -151,7 +172,7 @@ func parseSIDC(filePath string, batch *SolarBatch) (int, error) {
 		}
 
 		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
-		batch.AddRecord(date, 0, 0, float32(ssn), 0, 0, sourceFile)
+		batch.AddRecord(date, 0, 0, float32(ssn), 0, 0, 0, 0, sourceFile)
 		count++
 	}
 
@@ -200,7 +221,120 @@ func parseSFIJSON(filePath string, batch *SolarBatch) (int, error) {
 			ssn = 0
 		}
 
-		batch.AddRecord(date, observedFlux, float32(rec.SmoothedF107), ssn, 0, 0, sourceFile)
+		batch.AddRecord(date, observedFlux, float32(rec.SmoothedF107), ssn, 0, 0, 0, 0, sourceFile)
+		count++
+	}
+
+	return count, nil
+}
+
+// parseKpIndexJSON parses NOAA planetary K-index JSON format
+// Format: 2D array with header row ["time_tag", "Kp", "a_running", "station_count"]
+func parseKpIndexJSON(filePath string, batch *SolarBatch) (int, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return 0, err
+	}
+
+	// Parse as 2D string array
+	var rows [][]string
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return 0, fmt.Errorf("JSON parse error: %w", err)
+	}
+
+	if len(rows) < 2 {
+		return 0, fmt.Errorf("no data rows found")
+	}
+
+	sourceFile := filepath.Base(filePath)
+	count := 0
+
+	// Skip header row (index 0)
+	for i := 1; i < len(rows); i++ {
+		row := rows[i]
+		if len(row) < 3 {
+			continue
+		}
+
+		// Parse time_tag: "2026-01-27 00:00:00.000"
+		timeStr := row[0]
+		t, err := time.Parse("2006-01-02 15:04:05.000", timeStr)
+		if err != nil {
+			// Try without milliseconds
+			t, err = time.Parse("2006-01-02 15:04:05", timeStr)
+			if err != nil {
+				continue
+			}
+		}
+
+		// Parse Kp value
+		kp, err := strconv.ParseFloat(row[1], 32)
+		if err != nil {
+			continue
+		}
+
+		// Parse a_running (Ap equivalent)
+		ap, err := strconv.ParseFloat(row[2], 32)
+		if err != nil {
+			ap = 0
+		}
+
+		// Add record with Kp/Ap values, all other fields zero
+		batch.AddRecord(t, 0, 0, 0, float32(kp), float32(ap), 0, 0, sourceFile)
+		count++
+	}
+
+	return count, nil
+}
+
+// parseXrayFluxJSON parses GOES X-ray flux JSON format
+// Two energy bands per timestamp: "0.05-0.4nm" (short) and "0.1-0.8nm" (long)
+func parseXrayFluxJSON(filePath string, batch *SolarBatch) (int, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return 0, err
+	}
+
+	var records []XrayRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		return 0, fmt.Errorf("JSON parse error: %w", err)
+	}
+
+	sourceFile := filepath.Base(filePath)
+
+	// Group records by timestamp (two per timestamp: short and long)
+	type xrayPair struct {
+		time      time.Time
+		xrayShort float32
+		xrayLong  float32
+	}
+	pairs := make(map[string]*xrayPair)
+
+	for _, rec := range records {
+		// Parse time_tag: "2026-02-02T18:14:00Z"
+		t, err := time.Parse(time.RFC3339, rec.TimeTag)
+		if err != nil {
+			continue
+		}
+
+		key := rec.TimeTag
+		if pairs[key] == nil {
+			pairs[key] = &xrayPair{time: t}
+		}
+
+		// Assign flux based on energy band
+		switch rec.Energy {
+		case "0.05-0.4nm":
+			pairs[key].xrayShort = float32(rec.Flux)
+		case "0.1-0.8nm":
+			pairs[key].xrayLong = float32(rec.Flux)
+		}
+	}
+
+	count := 0
+	for _, p := range pairs {
+		// Add record with X-ray values, all other fields zero
+		batch.AddRecord(p.time, 0, 0, 0, 0, 0, p.xrayShort, p.xrayLong, sourceFile)
 		count++
 	}
 
@@ -212,9 +346,22 @@ func detectFormat(filePath string) string {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	base := strings.ToLower(filepath.Base(filePath))
 
+	// SIDC CSV format
 	if strings.HasPrefix(base, "sidc_") && ext == ".csv" {
 		return "sidc"
 	}
+
+	// NOAA K-index JSON
+	if strings.Contains(base, "kp_index") && ext == ".json" {
+		return "kp_json"
+	}
+
+	// GOES X-ray flux JSON
+	if strings.Contains(base, "xray") && ext == ".json" {
+		return "xray_json"
+	}
+
+	// SFI JSON (legacy naming)
 	if strings.Contains(base, "flux") && ext == ".txt" {
 		// Check if JSON
 		data, err := os.ReadFile(filePath)
@@ -222,6 +369,7 @@ func detectFormat(filePath string) string {
 			return "sfi_json"
 		}
 	}
+
 	return "unknown"
 }
 
@@ -235,10 +383,12 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "solar-ingest v%s - Solar Flux Data Ingester\n\n", Version)
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] [files...]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Ingests solar flux data from NOAA/SIDC sources into ClickHouse.\n\n")
+		fmt.Fprintf(os.Stderr, "Ingests solar flux data from NOAA/SIDC/GOES sources into ClickHouse.\n\n")
 		fmt.Fprintf(os.Stderr, "Supported formats:\n")
-		fmt.Fprintf(os.Stderr, "  - SIDC CSV (sidc_YYYY.csv): Daily sunspot numbers\n")
-		fmt.Fprintf(os.Stderr, "  - SFI JSON (sfi_daily_flux.txt): NOAA solar flux indices\n\n")
+		fmt.Fprintf(os.Stderr, "  - SIDC CSV (sidc_*.csv): Daily sunspot numbers\n")
+		fmt.Fprintf(os.Stderr, "  - SFI JSON (sfi_daily_flux.txt): NOAA solar flux indices\n")
+		fmt.Fprintf(os.Stderr, "  - Kp JSON (noaa_kp_index.json): Planetary K-index (3-hourly)\n")
+		fmt.Fprintf(os.Stderr, "  - X-ray JSON (goes_xray_flux.json): GOES X-ray flux (6-hour)\n\n")
 		flag.PrintDefaults()
 	}
 
@@ -329,6 +479,10 @@ func main() {
 			count, err = parseSIDC(filePath, batch)
 		case "sfi_json":
 			count, err = parseSFIJSON(filePath, batch)
+		case "kp_json":
+			count, err = parseKpIndexJSON(filePath, batch)
+		case "xray_json":
+			count, err = parseXrayFluxJSON(filePath, batch)
 		}
 
 		if err != nil {
