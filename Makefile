@@ -51,7 +51,7 @@ DISTDIR      := dist
 # Note: Legacy tools (wspr-ingest, wspr-ingest-cpu, wspr-ingest-fast) removed
 #       due to clickhouse-go/v2 API incompatibility. Replaced by faster tools.
 WSPR_CMDS   := wspr-shredder wspr-turbo wspr-parquet-native wspr-download
-SOLAR_CMDS  := solar-ingest solar-download
+SOLAR_CMDS  := solar-ingest solar-download solar-backfill
 ALL_CMDS    := $(WSPR_CMDS) $(SOLAR_CMDS)
 
 # Shell scripts to install
